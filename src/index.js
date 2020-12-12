@@ -1,4 +1,4 @@
-import request from 'request-promise'
+import fetch from 'node-fetch'
 import { propEq, find, equals, filter, not, map, pipe, toPairs, join } from 'ramda'
 import io from 'socket.io-client'
 const EventEmitter = require('events')
@@ -25,24 +25,35 @@ module.exports = class AmbientWeatherApi extends EventEmitter {
   _apiRequest (url) {
     return new Promise((resolve, reject) => {
       setTimeout(() => {
-        request({
-          url,
-          json: true
-        })
-        .then((res, body) => {
-          this.requestQueue = filter(pipe(equals(url), not), this.requestQueue)
-          resolve(res)
-        })
-        .catch((err) => {
-          // handle rate limiting
-          if (err.statusCode === 429) {
-            this.requestQueue.push(url)
-            this._apiRequest(url).then(resolve)
-
-          } else {
-            reject(err)
-          }
-        })
+        fetch(url)
+          .then(res => {
+            if (res.ok) {
+              return res;
+            } else if (res.status == 429) {
+              throw new RateLimitError("API Rate Limiting Error: %s %s", res.status, res.statusText)
+            } else {
+              throw new Error("HTTP Error Response: %s %s", res.status, res.statusText)
+            }
+          })
+          .then(res => res.json())
+          .then(json => {
+            this.requestQueue = filter(pipe(equals(url), not), this.requestQueue)
+            resolve(json)
+          })
+          .catch((err) => {
+            if (err instanceof RateLimitError) {
+              // handle rate limiting by retrying 2 more times
+              if (this.requestQueue.length < 3) {
+                this.requestQueue.push(url)
+                resolve(this._apiRequest(url).then(resolve))
+              } else {
+                this.requestQueue = filter(pipe(equals(url), not), this.requestQueue)
+                reject(new RateLimitError("Hit rate limit after 3 retries."));
+              }
+            } else {
+              reject(err)
+            }
+          })
       }, this.requestQueue.length * 1100)
     })
   }
@@ -103,5 +114,16 @@ module.exports = class AmbientWeatherApi extends EventEmitter {
   unsubscribe (apiKeyOrApiKeys) {
     const apiKeys = Array.isArray(apiKeyOrApiKeys) ? apiKeyOrApiKeys : [apiKeyOrApiKeys]
     this.socket.emit('unsubscribe', { apiKeys })
+  }
+}
+
+class RateLimitError extends Error {
+  constructor(...params) {
+    super(...params)
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, RateLimitError)
+    }
+
+    this.name = 'RateLimitError'
   }
 }
